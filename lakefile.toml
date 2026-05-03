@@ -1,0 +1,10 @@
+name = "mining"
+version = "0.1.0"
+defaultTargets = ["mining"]
+
+[[lean_lib]]
+name = "Mining"
+
+[[lean_exe]]
+name = "mining"
+root = "Main"
