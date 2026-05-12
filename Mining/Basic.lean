@@ -1,149 +1,9 @@
-import Std
+import Mining.Utils
+import Mining.Ops
+import Mining.Expressions
+
 open Std (HashSet HashMap)
-
-
-def Nat.asBitVec (n : Nat) := BitVec.ofNat 32 n
-
-def Option.both ( a b : (Option α)) : Option (α × α) :=
-  a.bind (fun a => b.bind (fun b => some (a, b)))
-
-def HashSet.map {α β} [BEq α] [Hashable α] [BEq β] [Hashable β]
-  (s : Std.HashSet α) (f : α → β) : Std.HashSet β :=
-  s.fold (init := ∅) (fun acc x => acc.insert (f x))
-
-
-inductive Op where
-  | add : Op
-  | sub : Op
-deriving Repr, BEq, Hashable
-
-instance : ToString Op where
-  toString op := toString (repr op)
-
-namespace Op
-
-  def binaryOp (T : Type) := T → T → T
-
-  def eval : Op → (binaryOp (BitVec 32))
-    | Op.add => BitVec.add
-    | Op.sub => BitVec.sub
-
-  def inverse : Op → Op
-  | add => sub
-  | sub => add
-
-  def commutative : Op → Bool
-    | add => true
-    | sub => false
-
-  -- a = b op c ↔ c = a rev b
-  def reverseInverse (op : Op) (a b : BitVec 32) : BitVec 32 :=
-    match op with
-    | sub => Op.sub.eval b a
-    -- commutative operations:
-    | _ => op.inverse.eval a b
-
-
-end Op
-
-
-inductive Identifier where
- | id (level : Nat) (symbol : String) : Identifier
-deriving BEq, Hashable, Repr
-
-instance : ToString Identifier where
-  toString
-  | Identifier.id level symbol =>  s!"{level}-{symbol}"
-
-open Identifier
-
-
-inductive Term where
-  | value (b : BitVec 32)
-  | var (v : Identifier)
-deriving BEq, Hashable, Repr
-
-instance : ToString Term where
-  toString
-    | Term.value b => toString b
-    | Term.var v => toString v
-
-class ToTerm (α : Type) where
-  toTerm : α → Term
-open ToTerm
-
-namespace Term
-
-  def number : Term → Option (BitVec 32)
-    | Term.value b => some b
-    | _ => none
-
-end Term
-
-instance : ToTerm Nat where
-  toTerm n := Term.value n
-
-instance : ToTerm Identifier where
-  toTerm (i) := Term.var i
-
-instance : ToTerm Term where
-  toTerm := id
-
-
-inductive Expr where
-  | atom : Term → Expr
-  | imk (operation : Op) (operand1 operand2 : Expr)
-deriving BEq, Hashable, Repr
-
-class ToExpr (α : Type) where
-  toExpr : α → Expr
-open ToExpr
-
-def exprToString : Expr → String
-  | Expr.atom term => toString term
-  | Expr.imk op x1 x2 => s!"{exprToString x1} {op} {exprToString x2}"
-
-instance : ToString Expr where
-  toString := exprToString
-
-def asExpr [ToExpr α] (a : α) := toExpr a
-
-instance : ToExpr Expr where
-  toExpr := id
-
-instance : ToExpr Term where
-  toExpr := Expr.atom
-
-instance : ToExpr (BitVec 32) where
-  toExpr bv := toExpr (Term.value bv)
-
-instance : ToExpr Nat where
-  toExpr n := toExpr (Term.value (BitVec.ofNat 32 n))
-
-instance : ToExpr Identifier where
-  toExpr i := toExpr (toTerm i)
-
-namespace Expr
-
-  def mk [ToExpr α] [ToExpr β] (op1 : α) op (op2 : β) :=
-    Expr.imk op (toExpr op1) (toExpr op2)
-
-  def number : Expr → Option (BitVec 32)
-  | atom term => term.number
-  | _ => none
-
-  def numbers : Expr → Option ((BitVec 32) × (BitVec 32))
-    | imk _ op1 op2 => Option.both (number op1) (number op2)
-    | _ => none
-
-  def evaluate (expr : Expr) : Expr := match expr with
-    | imk op _ _ =>
-      let nums? := expr.numbers
-      nums?.elim expr (fun nums => toExpr (op.eval nums.1 nums.2))
-
-    | _ => expr
-
-end Expr
+open Utils
 
 
 -- inductive Identity where
@@ -153,7 +13,7 @@ def Identity := Identifier × (BitVec 32)
 deriving BEq, Hashable, Repr
 
 instance : Inhabited Identity where
-  default := ((id 1 "a"), (0).asBitVec)
+  default := (⟨1, "a"⟩, (0).asBitVec)
 
 instance : ToString Identity where
   toString identity := s!"{identity.fst} = {identity.snd}"
@@ -185,47 +45,60 @@ def exampleEquation := equation 6 4 Op.add 2
 
 namespace Equation
 
+  def equality [ToTerm α] [ToTerm β] (a : α) (b : β) :=
+    equation a b Op.add 0
+
+  abbrev Contradiction := (BitVec 32 × BitVec 32)
   inductive Result where
   | eq : Equation → Result
   | id : Identity → Result
-  | re : Restriction → Result
+  | trivial : Result
+  | contradiction : Contradiction → Result
 
   instance : ToString Result where
     toString result := match result with
     | Result.eq eq => (toString eq)
     | Result.id ident => (toString ident)
-    | Result.re res => (toString res)
+    | Result.trivial => "Trivial"
+    | Result.contradiction (a, b) => s!"{a} = {b}"
 
   def toResult (left : Term) (right : BitVec 32) :=
     match left with
     | Term.var identifier => Result.id (identifier, right)
-    | Term.value num => Result.re (num, right)
+    | Term.value num =>
+        if num == right then Result.trivial else
+        Result.contradiction (num, right)
+    | Term.op unary innerTerm => toResult
+        (innerTerm) (unary.inverse.eval right)
+
+  -- def exampleTerm := (Term.op (rightRotate 4) (Term.var (id 1 "ex")))
+  -- #eval toResult exampleTerm 0x12345678
 
 
   def evaluate (equation : Equation) : Result :=
 
-    let rightExpr := (Expr.mk equation.op1 equation.op equation.op2)
+    let ⟨left, op1, op, op2⟩ := equation
+    let rightExpr := (Expr.mk op1 op op2)
     let rightNumber? := rightExpr.evaluate.number
-    rightNumber?.elim (Result.eq equation) (fun number =>
-      match equation.left with
-      | Term.var identifier => Result.id (identifier, number)
-      | Term.value leftNum => Result.re (leftNum, number)
-    )
+
+    rightNumber?.elim (Result.eq equation) (toResult left ·)
+
 
   def balance (argEq : Equation) : Result :=
+
     let ⟨left, op1, op, op2⟩ := argEq
-    match left with
-    | Term.var _ => Result.eq argEq
-    | Term.value nLeft =>
-      match op1 with
+    let leftNumber? := left.number
 
-      | Term.var _ => -- if the first operand is a variable, move second operand to the left
-        -- o1 = left op⁻¹ op2
-        Result.eq (equation op1 left (op.inverse) op2)
+    leftNumber?.elim (Result.eq argEq) (fun leftNum =>
 
-      | Term.value n1 => -- else, we have to move the first one to the left
-        (toResult op2 (op.reverseInverse nLeft n1))
+      if op == Op.and then (Result.eq argEq) else
 
+      op1.number.elim
+        -- if op1 is a variable, move op2 to the left
+        (Result.eq (equation op1 left (op.inverse) op2))
+        -- else, we have to move op1 to the left
+        (fun op1Num => (toResult op2 (op.reverseInverse leftNum op1Num)))
+      )
 
 end Equation
 
@@ -265,13 +138,15 @@ structure System where
   answers : (HashMap Identifier (BitVec 32))
   pending : (List Identity)
   restrictions : (HashSet Restriction)
+  contradictions : (HashSet Equation.Contradiction)
 
   abbrev Answers := (HashMap Identifier (BitVec 32))
 
 
 def asCollectionString [ToString α] (list : List α) (brackets : String × String) :=
+  let sortedStrings := (list.map toString).mergeSort
   s!"{brackets.fst}\n" ++
-  (",\n".intercalate (list.map (fun element => s!"  {toString element}")))
+  (",\n".intercalate (sortedStrings.map (fun string => s!"  {string}")))
   ++ s!"\n{brackets.snd}"
 
 instance : ToString Answers where
@@ -292,55 +167,46 @@ instance : ToString System where
 
 namespace System
 
-  def empty : System := System.mk {} {} [] {}
+  def empty : System := System.mk {} {} [] {} {}
 
-  def addEquation (system : System) (equation : Equation) :=
-      { system with equations := system.equations.insert equation }
+  class SystemAddition (α : Type) where
+    add : System → α → System
+
+  export SystemAddition (add)
+
+  instance : SystemAddition Equation where
+    add system equation := { system with equations := system.equations.insert equation }
+
+  instance : SystemAddition Identity where
+    add system pending := { system with pending := system.pending.concat pending }
+
+  instance : SystemAddition Equation.Contradiction where
+    add system contradiction := { system with contradictions := system.contradictions.insert contradiction }
+
+  instance : SystemAddition Equation.Result where
+    add system result :=
+      match result with
+    | Equation.Result.eq newEquation => system.add newEquation
+    | Equation.Result.id newIdentity => system.add newIdentity
+    | Equation.Result.trivial => system
+    | Equation.Result.contradiction (a, b) => system.add (a, b)
+
 
   def addAnswer (system : System) (answer : Identity) :=
       { system with answers := system.answers.insert answer.fst answer.snd }
 
-  def addPending (system : System) (pending : Identity) :=
-      { system with pending := system.pending.concat pending }
-
   def addRestriction (system : System) (restriction : Restriction) :=
       { system with restrictions := system.restrictions.insert restriction }
 
-  def apply (system : System) (result : Equation.Result) :=
-    match result with
-    | Equation.Result.eq newEquation => system.addEquation newEquation
-    | Equation.Result.id newIdentity => system.addPending newIdentity
-    | Equation.Result.re newRestriction => system.addRestriction newRestriction
 
   def applyToEquations (system₀ : System) (processor : Equation → Equation.Result) :=
     let equationsToProcess := system₀.equations
     equationsToProcess.fold
       (init := { system₀ with equations := {} })
       (fun system equation =>
-        system.apply (processor equation) )
+        system.add (processor equation) )
 
 end System
-
-#eval (HashSet.ofList [1, 2, 3]).partition (fun x => x < 3)
-
--- 2 h8 = 0 = 1 h8 + 1 a
--- 1 h8 = 0 - 1 a
-
-def goalEq1 := equation (id 1 "h8") (10) Op.sub (id 1 "h")
-def goalEq2 := equation (id 1 "h7") (id 1 "h") Op.sub (id 1 "g")
-def identity1 : Identity := ((id 1 "h8"), ((3).asBitVec))
-def identity2 : Identity := ((id 1 "h7"), ((3).asBitVec))
-
-#eval goalEq1
-#eval identity2.substitute goalEq1
-#eval goalEq1.balance
-#eval identity1.substitute goalEq1
-#eval (identity1.substitute goalEq1).balance
-
-#eval goalEq2
-#eval goalEq2.balance
-#eval identity2.substitute goalEq2
-#eval (identity2.substitute goalEq2).balance
 
 
 def h1s := [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -350,19 +216,130 @@ def h2s := [0x6705d79c, 0xbdf5a4d, 0x9793c992, 0x41a0ad81, 0x1f13094d, 0x7827010
 
 def letters := ["a", "b", "c", "d", "e", "f", "g", "h"]
 
-def h1Terms := h1s.map (toTerm ·)
-def h2Terms := h2s.map (toTerm ·)
-def letterIdentifiers := letters.map (id 1 · )
-def letterTerms := letterIdentifiers.map (toTerm ·)
+def letters63 := [0x5077abc8, 0x5b24d620, 0x9c50b847, 0xbe6dc7e7, 0xdd219874, 0xe07c2655, 0xa41f32e7, 0xbd43aa60]
 
-def myEquations := ((h1Terms.zip h2Terms).zip letterTerms).map
-  fun tup => equation tup.1.2 tup.1.1 Op.add tup.2
 
-def mySystem := System.mk (HashSet.ofList myEquations) {} [] {}
+namespace Sha256
 
-#eval myEquations
+  def rightRotate [ToTerm α] (n : Nat) (t : α) := Term.op (Unary.rightRotate n) (toTerm t)
+
+  def tripleRotate (identifier : Identifier) (letter : Identifier) (r1 r2 r3 : Nat) :=
+
+    let auxIdentifier : Identifier := ⟨identifier.level, (identifier.symbol ++ ".aux")⟩
+
+    let firstEquation :=
+      equation auxIdentifier (rightRotate r1 letter) Op.xor (rightRotate r2 letter)
+
+    let secondEquation :=
+      equation identifier auxIdentifier Op.xor (rightRotate r3 letter)
+
+    [firstEquation, secondEquation]
+
+  -- #eval tripleRotate ⟨63, "S1"⟩ ⟨63, "e"⟩ 6 11 25
+
+  def not [ToTerm α] (t : α) := Term.op Unary.not (toTerm t)
+
+  def crossedAnd (level : Nat) :=
+    let ⟨ch, ch1, ch2⟩ : onePlusTuple 2 Identifier :=
+      (⟨level, "ch"⟩, ⟨level, "ch.1"⟩, ⟨level, "ch.2"⟩)
+
+    let ⟨e, f, g⟩ : onePlusTuple 2 Identifier :=
+      (⟨level, "e"⟩, ⟨level, "f"⟩, ⟨level, "g"⟩)
+
+    let equation₁ := equation ch1 e Op.and f
+    let equation₂ := equation ch2 (not e) Op.and g
+    let finalEquation := equation ch ch1 Op.xor ch2
+
+    [equation₁, equation₂, finalEquation]
+
+  def temp1Equations (level : Nat) :=
+    let ⟨temp1, temp1₁, temp1₂, temp1₃⟩ : onePlusTuple 3 Identifier :=
+      (⟨level, "temp1"⟩, ⟨level, "temp1.1"⟩, ⟨level, "temp1.2"⟩, ⟨level, "temp1.3"⟩)
+
+    let ⟨h, S1, ch, k, w⟩ : onePlusTuple 4 Identifier :=
+      (⟨level, "h"⟩, ⟨level, "S1"⟩, ⟨level, "ch"⟩, ⟨level, "k"⟩, ⟨level, "w"⟩)
+
+    let eq1 := equation temp1₁ h Op.add S1
+    let eq2 := equation temp1₂ temp1₁ Op.add ch
+    let eq3 := equation temp1₃ temp1₂ Op.add k
+    let finalEquation := equation temp1 temp1₃ Op.add w
+
+    [eq1, eq2, eq3, finalEquation]
+
+  def majEquations (level : Nat) :=
+    let ⟨maj, maj1, maj2, maj3, maj4⟩ : onePlusTuple 4 Identifier :=
+      (⟨level, "maj"⟩, ⟨level, "maj1"⟩, ⟨level, "maj2"⟩, ⟨level, "maj3"⟩, ⟨level, "maj4"⟩)
+
+    let ⟨a, b, c⟩ : onePlusTuple 2 Identifier :=
+      (⟨level, "a"⟩, ⟨level, "b"⟩, ⟨level, "c"⟩)
+
+    let eq1 := equation maj1 a Op.and b
+    let eq2 := equation maj2 a Op.and c
+    let eq3 := equation maj3 b Op.and c
+    let eq4 := equation maj4 maj1 Op.xor maj2
+
+    let finalEquation := equation maj maj4 Op.xor maj3
+
+    [eq1, eq2, eq3, eq4, finalEquation]
+
+    def letterIdentifiers (level : Nat) : onePlusTuple 7 Identifier :=
+      (⟨level, "a"⟩, ⟨level, "b"⟩, ⟨level, "c"⟩, ⟨level, "d"⟩,
+       ⟨level, "e"⟩, ⟨level, "f"⟩, ⟨level, "g"⟩, ⟨level, "h"⟩)
+
+    def letterReasignEquations (level : Nat) :=
+
+      let ⟨a, b, c, d, e, f, g, h⟩ : onePlusTuple 7 Identifier :=
+        letterIdentifiers level
+
+      let ⟨a2, b2, c2, d2, e2, f2, g2, h2⟩ : onePlusTuple 7 Identifier :=
+        letterIdentifiers (level + 1)
+
+      let ⟨temp1, temp2⟩ : onePlusTuple 1 Identifier :=
+        (⟨level, "temp1"⟩, ⟨level, "temp2"⟩)
+
+      [
+        Equation.equality h2 g,
+        Equation.equality g2 f,
+        Equation.equality f2 e,
+        equation e2 d Op.add temp1,
+        Equation.equality d2 c,
+        Equation.equality c2 b,
+        Equation.equality b2 a,
+        equation a2 temp1 Op.add temp2,
+      ]
+
+
+    def sha256Equations (level : Nat) :=
+
+      let ⟨a, b, c, d, e, f, g, h⟩ : onePlusTuple 7 Identifier :=
+        letterIdentifiers level
+
+      let ⟨S1, ch, temp1, S0, maj, temp2⟩ : onePlusTuple 5 Identifier :=
+      (⟨level, "S1"⟩, ⟨level, "ch"⟩, ⟨level, "temp1"⟩,
+       ⟨level, "S0"⟩, ⟨level, "maj"⟩, ⟨level, "temp2"⟩)
+
+      let eqsS1 := tripleRotate S1 e 6 11 25
+      let eqsch := crossedAnd level
+      let eqstemp1 := temp1Equations level
+      let eqsS0 := tripleRotate S0 a 2 13 22
+      let eqsmaj := majEquations level
+      let eqstemp2 := [equation temp2 S0 Op.add maj]
+      let eqsLetters := letterReasignEquations level
+
+      eqsS1 ++ eqsch ++ eqstemp1 ++ eqsS0 ++
+        eqsmaj ++ eqstemp2 ++ eqsLetters
+
+  def k63 := 0xc67178f2
+  def w63 := 0x5e809082
+
+
+end Sha256
+
+
+def mySystem := (Sha256.sha256Equations 63).foldl
+  (init := System.empty) (fun prev equation => prev.add equation)
+
 #eval mySystem
-#eval myEquations.map (·.balance)
 #eval mySystem.applyToEquations Equation.balance
 
 -- def letters := [0xfcfbf135, 0x5077abc8, 0x5b24d620, 0x9c50b847, 0xce04b6ce, 0xdd219874, 0xe07c2655,
@@ -376,16 +353,3 @@ def mySystem := System.mk (HashSet.ofList myEquations) {} [] {}
 
 -- #eval res
 -- #eval (List.zip res letters).map (fun pair => pair.1 - pair.2) == h1s
-
-namespace Afuera
-
-class Adentro (α : Type) where
-  adentro := Nat
-
-
-#check Adentro.adentro
-export Adentro (adentro)
-
-end Afuera
-
-#check Afuera.adentro
