@@ -38,10 +38,15 @@ export ToTerm (toTerm)
 namespace Term
 
   def number : Term → Option (BitVec 32)
-    | Term.value b => some b
-    | Term.op unary term =>
-        term.number.elim none (fun num => unary.eval num)
-    | _ => none
+  | Term.value b => some b
+  | Term.op unary term =>
+    term.number.elim none (fun num => unary.eval num)
+  | _ => none
+
+  def identifier : Term → Option (Identifier)
+  | Term.var v => some v
+  | Term.op _ term => term.identifier
+  | _ => none
 
 end Term
 

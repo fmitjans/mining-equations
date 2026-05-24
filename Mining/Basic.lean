@@ -82,16 +82,21 @@ namespace Equation
     let ⟨left, op1, op, op2⟩ := argEq
     let leftNumber? := left.number
 
-    leftNumber?.elim (Result.eq argEq) (fun leftNum =>
+    leftNumber?.elim (argEq.evaluate) (fun leftNum =>
 
-      if op == Op.and then (Result.eq argEq) else -- skip for now
+      if op == Op.and then (argEq.evaluate) else -- skip for now
 
       op1.number.elim
         -- if op1 is a variable, move op2 to the left
-        (Result.eq (equation op1 left (op.inverse) op2))
+        ((equation op1 left (op.inverse) op2).evaluate)
         -- else, we have to move op1 to the left
         (fun op1Num => (toResult op2 (op.reverseInverse leftNum op1Num)))
       )
+
+  def identifiers (argEq : Equation) : List Identifier :=
+    let ⟨left, op1, _, op2⟩ := argEq
+    [left.identifier, op1.identifier, op2.identifier].foldl
+      (init := []) (fun prev element => prev ++ element.toList)
 
 end Equation
 
@@ -144,13 +149,15 @@ instance : ToString System.Steps where toString step := toString (repr step)
 
 
 structure System where
-  equations : (HashSet Equation)
+  equations : HashMap Identifier (HashSet Equation)
   answers : (HashMap Identifier (BitVec 32))
   pending : (List Identity)
   contradictions : (HashSet Equation.Contradiction)
   nextStep : System.Steps
+  definitions : List Identity
 
   abbrev Answers := (HashMap Identifier (BitVec 32))
+  abbrev SysEquations := HashMap Identifier (HashSet Equation)
 
 
 def asCollectionString [ToString α] (list : List α) (brackets : String × String) :=
@@ -168,6 +175,17 @@ instance [BEq α] [Hashable α] [ToString α]: ToString (HashSet α) where
 instance : ToString (List Identity) where
   toString identities := asCollectionString identities ("[", "]")
 
+instance : ToString SysEquations where
+  toString equationsMap :=
+
+    let equationSets : List (HashSet Equation) :=
+      equationsMap.toList.map (fun pair => pair.snd)
+
+    let singleSet : HashSet Equation := (equationSets.foldl
+      (init := {}) (fun prev newSet => prev.union newSet))
+
+    asCollectionString singleSet.toList ("[", "]")
+
 instance : ToString System where
   toString system :=
     s!"equations:\n{system.equations}\n" ++
@@ -178,15 +196,12 @@ instance : ToString System where
 
 namespace System
 
-  def empty : System := System.mk {} {} [] {} Steps.balance
+  def empty : System := System.mk {} {} [] {} Steps.balance []
 
   class SystemAddition (α : Type) where
     add : System → α → System
 
   export SystemAddition (add)
-
-  instance : SystemAddition Equation where
-    add system equation := { system with equations := system.equations.insert equation }
 
   instance : SystemAddition Identity where
     add system pending := { system with pending := system.pending.concat pending }
@@ -194,44 +209,70 @@ namespace System
   instance : SystemAddition Equation.Contradiction where
     add system contradiction := { system with contradictions := system.contradictions.insert contradiction }
 
+  def addUnprocessed (system : System) (argEq : Equation) :=
+    let eqIdentifiers := argEq.identifiers
+      let newEquations := eqIdentifiers.foldl (init := system.equations)
+        (fun prev identifier => insertIntoValue prev identifier argEq)
+      {system with equations := newEquations }
+
   instance : SystemAddition Equation.Result where
     add system result :=
       match result with
-    | Equation.Result.eq newEquation => system.add newEquation
+    | Equation.Result.eq newEquation => system.addUnprocessed newEquation
     | Equation.Result.id newIdentity => system.add newIdentity
     | Equation.Result.trivial => system
     | Equation.Result.contradiction (a, b) => system.add (a, b)
+
+  instance : SystemAddition Equation where
+    add system argEq := system.add argEq.balance
 
 
   def addAnswer (system : System) (answer : Identity) :=
       { system with answers := system.answers.insert answer.fst answer.snd }
 
+  def addDefinition (system : System) (definition : Identity) :=
+    { system with definitions := system.definitions.insert definition }
+
   def addList [SystemAddition α] (system : System) (list : List α) :=
     list.foldl (init := system) (fun prev addition => prev.add addition)
 
-  def applyToEquations (system₀ : System) (processor : Equation → Equation.Result) :=
-    let equationsToProcess := system₀.equations
-    equationsToProcess.fold
-      (init := { system₀ with equations := {} })
-      (fun system equation =>
-        system.add (processor equation) )
+  def deleteEquation (system : System) (argEq : Equation) :=
+    let newEquations := argEq.identifiers.foldl (init := system.equations)
+      (fun prevEqs identifier =>
+        prevEqs.modify identifier (fun prevSet => prevSet.erase argEq))
+
+    { system with equations := newEquations }
+
+  -- def applyToEquations (system₀ : System) (processor : Equation → Equation.Result) :=
+  --   let equationsToProcess := system₀.equations
+  --   equationsToProcess.fold
+  --     (init := { system₀ with equations := {} })
+  --     (fun system equation =>
+  --       system.add (processor equation) )
 
   def substitute (system : System) (identity : Identity) :=
     let ⟨identifier, value⟩ := identity
 
     match (system.answers.get? identifier) with
 
-    | none =>
-      let newEquations := system.equations.fold
-        (init := { system with equations := {} })
-        (fun (prev : System) (equation : Equation) =>
-          prev.add (equation.substitute identity))
-
-      newEquations.addAnswer identity
-
     | some existingValue =>
-      if existingValue == value then system else
-      system.add ((existingValue, value) : Equation.Contradiction)
+        if existingValue == value then system else
+        system.add ((existingValue, value) : Equation.Contradiction)
+
+    | none =>
+        let affectedEquations : List Equation :=
+          let affectedSet? := system.equations[identifier]?
+          (affectedSet?.toList.map (fun set => HashSet.toList set)).flatten
+
+        let systemWithNewEquations := affectedEquations.foldl (init := system)
+          (fun prev (argEq : Equation) =>
+          let newEquation := argEq.substitute identity
+          prev
+            |> (System.deleteEquation · argEq)
+            |> (System.add · newEquation.balance)
+          )
+
+        systemWithNewEquations.addAnswer identity
 
 
   def changeStep (system : System) :=
@@ -245,14 +286,17 @@ namespace System
       (fun prev identity =>
         prev.substitute identity)
 
-  def next (system : System) := match system.nextStep with
-    | Steps.balance => (system.applyToEquations Equation.balance).changeStep
-    | Steps.evaluate => (system.applyToEquations Equation.evaluate).changeStep
-    | Steps.substitute => system |> .substituteAll |> .changeStep
+  -- def next (system : System) := match system.nextStep with
+  --   | Steps.balance => (system.applyToEquations Equation.balance).changeStep
+  --   | Steps.evaluate => (system.applyToEquations Equation.evaluate).changeStep
+  --   | Steps.substitute => system |> .substituteAll |> .changeStep
 
   def goFoward (system : System) (steps : Nat) := match steps with
   | 0 => system
-  | n + 1 => (system.goFoward n).next
+  | n + 1 =>
+    if system.contradictions.isEmpty.not then system
+    else if system.pending.isEmpty then system
+    else (system.substituteAll).goFoward n
 
 end System
 
@@ -438,10 +482,7 @@ def mySystem :=
   |> (·.addList Sha256.sha256Identities)
   |> (·.addList (letterIds 54))
 
-
-#eval (55...64).toList.map fun n => Sha256.levelEquations n
 #eval mySystem
-def system0 := mySystem.goFoward 6
 -- #eval mySystem.goFoward 3
 -- #eval mySystem.goFoward 4
 -- #eval mySystem.goFoward 5
