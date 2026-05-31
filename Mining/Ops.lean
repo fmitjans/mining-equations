@@ -48,6 +48,8 @@ inductive Unary where
   | not : Unary
   | rightRotate : Nat → Unary
   | leftRotate : Nat → Unary
+  | rightShift : Nat → Unary
+  | leftShift : Nat → Unary
 deriving Repr, BEq, Hashable
 
 instance : ToString Unary where
@@ -59,11 +61,15 @@ namespace Unary
   | not => BitVec.not
   | rightRotate n => fun bv => bv.rotateRight n
   | leftRotate n => fun bv => bv.rotateLeft n
+  | rightShift n => fun bv => bv.ushiftRight n
+  | leftShift n => fun bv => bv.shiftLeft n
 
   def inverse : Unary → Unary
   | not => not
   | rightRotate n => leftRotate n
   | leftRotate n => rightRotate n
+  | rightShift n => leftShift n -- not true, todo fix
+  | leftShift n => rightShift n
 
 end Unary
 
